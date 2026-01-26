@@ -5,7 +5,7 @@ import pandas as pd
 # -----------------------
 # Parameters from experiment
 # -----------------------
-Za = 90      # Ohms (coaxial cable)
+Za = 150    # Ohms (coaxial cable)
 L = 330e-6     # H (fixed - physical inductor value)
 C = 15e-9      # F (fixed - physical capacitor value)
 
@@ -21,10 +21,10 @@ omega = 2*np.pi*f
 # -----------------------
 # Ladder characteristic impedance
 # -----------------------
-Zb = np.sqrt(L/C) / np.sqrt(1 - omega**2 * L * C / 4)
+Zb = np.sqrt((L/C)/(1 - omega**2 * L * C / 4))
 
 # -----------------------
-# Voltage transmission ratio (LAB FORMULA)
+# Voltage transmission ratio
 # -----------------------
 Vratio = 2*Za / (Zb + Za)
 
