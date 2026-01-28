@@ -15,69 +15,67 @@ def load_dataset(path):
 	return timestamp, output_voltage, output_current, thermistor_temperatures
 
 
-def calculate_qc_dot(voltage, current, alpha, K, T_cold, delta_T):
+def calculate_qc(alpha, I, Tc, R, K, Th):
 	"""
-	Calculate net heat flow rate at cold side: Q̇c = αITc - (1/2)IV + (1/2)αIΔT - KΔT
+	Calculate heat flow rate at cold side.
+	Heat added to cold plate: - Peltier removal + 1/2 Joule heating + Conductive leak from hot side
 	
 	Parameters:
-	- voltage: Voltage across Peltier device (V)
-	- current: Current through Peltier device (A)
 	- alpha: Seebeck coefficient (V/K)
-	- K: Thermal conductance (W/K)
-	- T_cold: Cold side temperature in Kelvin
-	- delta_T: Temperature difference across Peltier (Thot - Tcold) in Kelvin
-	"""
-	# Calculate Q̇c components
-	# Q̇c = αITc - (1/2)IV + (1/2)αIΔT - KΔT
-	peltier_pumping = alpha * current * T_cold
-	electrical_power_cold = -0.5 * current * voltage
-	seebeck_correction = 0.5 * alpha * current * delta_T
-	conduction_leak = -K * delta_T
-	
-	qc_dot = peltier_pumping + electrical_power_cold + seebeck_correction + conduction_leak
-	
-	return qc_dot
-
-
-def calculate_heat_flux_at_boundary(voltage, current, T_cold, alpha, K, delta_T, R, A):
-	"""
-	Calculate heat flux at x=0 boundary: -k * (∂T/∂x)|_(x=0) = (1/A) * [αITc - (1/2)I²R - K(Th - Tc)]
-	
-	Parameters:
-	- voltage: Voltage across Peltier device (V)
-	- current: Current through Peltier device (A)
-	- T_cold: Cold side temperature in Kelvin
-	- alpha: Seebeck coefficient (V/K)
-	- K: Thermal conductance (W/K)
-	- delta_T: Temperature difference across Peltier (Th - Tc) in Kelvin
+	- I: Current through Peltier device (A)
+	- Tc: Cold side temperature (K)
 	- R: Electrical resistance (Ohms)
-	- A: Cross-sectional area (m²)
+	- K: Thermal conductance (W/K)
+	- Th: Hot side temperature (K)
 	"""
-	# Calculate heat flux: (1/A) * [αITc - (1/2)I²R - K(Th - Tc)]
-	# Note: Th = Tc + delta_T
-	heat_flux = (1.0 / A) * (alpha * current * T_cold - 0.5 * current**2 * R - K * delta_T)
+	# Heat added to cold plate: 
+	# - Peltier removal + 1/2 Joule heating + Conductive leak from hot side
+	qc = - (alpha * I * Tc) + (0.5 * I**2 * R) + K * (Th - Tc)
+	return qc
+
+
+def calculate_qh(alpha, I, Th, R, K, Tc):
+	"""
+	Calculate heat flow rate at hot side.
+	Heat added to hot plate: + Peltier dumping + 1/2 Joule heating - Conductive leak to cold side
 	
-	return heat_flux
+	Parameters:
+	- alpha: Seebeck coefficient (V/K)
+	- I: Current through Peltier device (A)
+	- Th: Hot side temperature (K)
+	- R: Electrical resistance (Ohms)
+	- K: Thermal conductance (W/K)
+	- Tc: Cold side temperature (K)
+	"""
+	# Heat added to hot plate: 
+	# + Peltier dumping + 1/2 Joule heating - Conductive leak to cold side
+	qh = (alpha * I * Th) + (0.5 * I**2 * R) - K * (Th - Tc)
+	return qh
 
 
-def solve_1d_heat_equation(t_span, x_grid, T_initial, voltage_func, current_func, 
+def solve_1d_heat_equation(t_span, x_grid, T_initial, voltage_func,
                            L, radius, alpha, K, T_cold, R, D_brass, k_brass, 
-                           h, rho, c, T_infinity, rtol, atol):
+                           h, rho, c, T_infinity, C_ceramic_hot, A_ceramic_hot, h_ceramic_hot, rtol, atol):
 	"""
 	Solve 1D heat equation with convective heat loss: ∂T/∂t = D * ∂²T/∂x² - (hP/(ρcA))[T - T∞]
+	Also solves coupled differential equation for Th (hot side ceramic plate temperature).
 	
 	Boundary conditions:
-	- At x=0: k * (∂T/∂x)|_(x=0) = -(1/A) * [αITc - (1/2)I²R - K(Th - Tc)]
-	- At x=L: -k * (∂T/∂x)|_(x=L) = h * (T(L) - T∞) (convective heat exchange)
+	- At x=0: -k_rod * (∂T/∂x)|_(x=0) = Q_c(t)
+	  where Q_c(t) = -αIT_c + (1/2)I²R + K(T_h - T_c)  (heat added to cold plate)
+	  and T_c(t) = T_rod(0, t)  (rod temperature at interface equals cold plate temperature)
+	- At x=L: (∂T/∂x)|_(x=L) = 0 (insulated boundary - avoids double-counting convection)
 	
-	ΔT is calculated dynamically from: V = IR + αΔT, so ΔT = (V - IR) / α
+	Coupled differential equation:
+	- C_h * Ṫ_h = Q_h + h_h * A_h * (T_∞ - T_h)
+	
+	Note: No separate ceramic ODE for cold side - T[0] is the cold plate temperature.
 	
 	Parameters:
 	- t_span: Time span (t0, tf) in seconds
 	- x_grid: Spatial grid points (array)
 	- T_initial: Initial temperature distribution (array, same length as x_grid)
 	- voltage_func: Function voltage(t) returning voltage at time t
-	- current_func: Function current(t) returning current at time t
 	- L: Length of the cylinder (m)
 	- radius: Radius of the cylinder (m)
 	- alpha: Seebeck coefficient (V/K)
@@ -86,10 +84,13 @@ def solve_1d_heat_equation(t_span, x_grid, T_initial, voltage_func, current_func
 	- R: Electrical resistance (Ohms)
 	- D_brass: Thermal diffusivity of brass (m²/s)
 	- k_brass: Thermal conductivity of brass (W/(m·K))
-	- h: Convective heat transfer coefficient (W/(m²·K))
+	- h: Convective heat transfer coefficient for brass rod (W/(m²·K))
 	- rho: Density of brass (kg/m³)
 	- c: Specific heat capacity of brass (J/(kg·K))
 	- T_infinity: Ambient/environment temperature (K)
+	- C_ceramic_hot: Heat capacity of hot ceramic plate (J/K)
+	- A_ceramic_hot: Surface area of hot ceramic plate (m²)
+	- h_ceramic_hot: Convective heat transfer coefficient for hot ceramic plate (W/(m²·K))
 	- rtol: Relative tolerance for ODE solver
 	- atol: Absolute tolerance for ODE solver
 	"""
@@ -104,71 +105,70 @@ def solve_1d_heat_equation(t_span, x_grid, T_initial, voltage_func, current_func
 	dx = x_grid[1] - x_grid[0]
 	N = len(x_grid)
 	
-	def heat_equation_rhs(t, T):
-		"""Right-hand side of the heat equation."""
-		dTdt = np.zeros_like(T)
+	# State vector: T[0] to T[N-1] are rod temperatures (T[0] = Tc), T[N] is Th
+	def heat_equation_rhs(t, T_full):
+		"""Right-hand side of the coupled heat equation system."""
+		# Split state vector: rod temperatures and hot side ceramic plate temperature
+		T_rod = T_full[:N]  # Rod temperatures T[0] to T[N-1], where T[0] = Tc
+		Tc = T_rod[0]       # Cold side temperature (rod temperature at x=0)
+		Th = T_full[N]      # Hot side ceramic plate temperature
 		
-		# Get current voltage and current at time t
+		dTdt = np.zeros_like(T_full)
+		
+		# Calculate current from voltage using: I(t) = (V(t) - α(T_h - T_c)) / R
 		V = voltage_func(t)
-		I = current_func(t)
+		I = (V - alpha * (Th - Tc)) / R
 		
-		# Calculate delta_T dynamically from: V = IR + αΔT
-		# So: ΔT = (V - IR) / α
-		delta_T = (V - I * R) / alpha
+		# Calculate Qc and Qh using coupled equations
+		Qc = calculate_qc(alpha, I, Tc, R, K, Th)
+		Qh = calculate_qh(alpha, I, Th, R, K, Tc)
 		
-		# Calculate heat flux at x=0 boundary
-		# Boundary condition: k * (∂T/∂x)|_(x=0) = -(1/A) * [αITc - (1/2)I²R - K(Th - Tc)]
-		# Convention: Negative flux = heat INPUT (flowing INTO the system)
-		#             Positive flux = heat OUTPUT (flowing OUT of the system)
-		# Using Tc = T[0] (temperature at x=0)
-		Tc = T[0]
-		# Calculate heat flux: negative means heat input, positive means heat output
-		# For Peltier cooling, we want to remove heat (positive flux = heat out)
-		# The equation gives: (1/A) * [αITc - (1/2)I²R - K(Th - Tc)]
-		# We need to negate this to match our convention where negative = heat in
-		heat_flux = -(1.0 / A) * (alpha * I * Tc - 0.5 * I**2 * R - K * delta_T)
+		# Boundary condition at x=0: -k_rod * (∂T/∂x)|_(x=0) = Q_c(t)
+		# Rearranging: (∂T/∂x)|_(x=0) = -Q_c / k_rod
+		# Using ghost point: (T[1] - T[-1]) / (2*dx) = -Q_c / k_rod
+		# So: T[-1] = T[1] - (2*dx / k) * Q_c
+		# T[0] = Tc (rod temperature at interface equals cold plate temperature)
+		# No separate ceramic ODE for Tc - it evolves only through the rod equation
+		T_ghost_0 = T_rod[1] - 2 * dx * Qc / k_brass
+		diffusion_term_0 = D_brass * (T_rod[1] - 2*Tc + T_ghost_0) / dx**2
+		convective_term_0 = -convective_coeff * (Tc - T_infinity)
+		dTdt[0] = diffusion_term_0 + convective_term_0
 		
 		# Interior points: ∂T/∂t = D * ∂²T/∂x² - (hP/(ρcA))[T - T∞]
 		# Using central difference for spatial derivative
 		for i in range(1, N-1):
-			diffusion_term = D_brass * (T[i+1] - 2*T[i] + T[i-1]) / dx**2
-			convective_term = -convective_coeff * (T[i] - T_infinity)
+			diffusion_term = D_brass * (T_rod[i+1] - 2*T_rod[i] + T_rod[i-1]) / dx**2
+			convective_term = -convective_coeff * (T_rod[i] - T_infinity)
 			dTdt[i] = diffusion_term + convective_term
 		
-		# Boundary condition at x=0: k * (∂T/∂x)|_(x=0) = heat_flux
-		# Rearranging: (∂T/∂x)|_(x=0) = heat_flux / k
-		# Using ghost point method: introduce T[-1] such that
-		# (∂T/∂x)|_(x=0) ≈ (T[1] - T[-1]) / (2*dx) = heat_flux / k
-		# So: T[1] - T[-1] = 2*dx*heat_flux / k
-		# Therefore: T[-1] = T[1] - 2*dx*heat_flux / k
-		# For the heat equation at x=0: dT[0]/dt = D * (T[1] - 2*T[0] + T[-1]) / dx² - (hP/(ρcA))[T[0] - T∞]
-		T_ghost_0 = T[1] + 2 * dx * heat_flux / k_brass
-		diffusion_term_0 = D_brass * (T[1] - 2*T[0] + T_ghost_0) / dx**2
-		convective_term_0 = -convective_coeff * (T[0] - T_infinity)
-		dTdt[0] = diffusion_term_0 + convective_term_0
+		# Solve for Th: C_h * Ṫ_h = Q_h + h_h * A_h * (T_∞ - T_h)
+		dTdt[N] = (Qh + h_ceramic_hot * A_ceramic_hot * (T_infinity - Th)) / C_ceramic_hot
 		
-		# Boundary condition at x=L: -k * (∂T/∂x)|_(x=L) = h * (T(L) - T∞)
-		# Rearranging: (∂T/∂x)|_(x=L) = -h/k * (T(L) - T∞)
-		# Using ghost point method: introduce T[N] such that
-		# (∂T/∂x)|_(x=L) ≈ (T[N] - T[N-2]) / (2*dx) = -h/k * (T[N-1] - T∞)
-		# So: T[N] - T[N-2] = -2*dx * h/k * (T[N-1] - T∞)
-		# Therefore: T[N] = T[N-2] - 2*dx * h/k_brass * (T[N-1] - T_infinity)
+		# Boundary condition at x=L: Insulated boundary (∂T/∂x)|_(x=L) = 0
+		# This avoids double-counting convection, since distributed convection -hP/(ρcA)(T - T∞)
+		# is already applied everywhere including at x=L
+		# Using ghost point method: (∂T/∂x)|_(x=L) ≈ (T[N] - T[N-2]) / (2*dx) = 0
+		# So: T[N] = T[N-2]
 		# For the heat equation at x=L: dT[N-1]/dt = D * (T[N] - 2*T[N-1] + T[N-2]) / dx² - (hP/(ρcA))[T[N-1] - T∞]
-		T_ghost_L = T[N-2] - 2 * dx * h / k_brass * (T[N-1] - T_infinity)
-		diffusion_term_L = D_brass * (T_ghost_L - 2*T[N-1] + T[N-2]) / dx**2
-		convective_term_L = -convective_coeff * (T[N-1] - T_infinity)
+		T_ghost_L = T_rod[N-2]  # Insulated: no heat flux across boundary
+		diffusion_term_L = D_brass * (T_ghost_L - 2*T_rod[N-1] + T_rod[N-2]) / dx**2
+		convective_term_L = -convective_coeff * (T_rod[N-1] - T_infinity)
 		dTdt[N-1] = diffusion_term_L + convective_term_L
 		
 		return dTdt
 	
+	# Initial conditions: rod temperatures + Th
+	T_hot_initial = T_cold  # Initial hot side temperature (same as cold side initially)
+	T_initial_full = np.concatenate([T_initial, [T_hot_initial]])  # Add Th to state vector
+	
 	# Solve the ODE system
-	sol = solve_ivp(heat_equation_rhs, t_span, T_initial, 
+	sol = solve_ivp(heat_equation_rhs, t_span, T_initial_full, 
 	                method='RK45', dense_output=True, rtol=rtol, atol=atol)
 	
 	return sol
 
 
-def plot_temperature_vs_time(sol, timestamp, thermistor_0_data, voltage_func, current_func,
+def plot_temperature_vs_time(sol, timestamp, thermistor_0_data, voltage_func,
                             radius, alpha, K, R):
 	"""
 	Plot temperature as a function of time at x=0, thermistor 0 data, and heat flux Q at x=0.
@@ -178,7 +178,6 @@ def plot_temperature_vs_time(sol, timestamp, thermistor_0_data, voltage_func, cu
 	- timestamp: Original time data for reference
 	- thermistor_0_data: Thermistor 0 temperature data (array)
 	- voltage_func: Function voltage(t) returning voltage at time t
-	- current_func: Function current(t) returning current at time t
 	- radius: Radius of cylinder (m)
 	- alpha: Seebeck coefficient (V/K)
 	- K: Thermal conductance of Peltier (W/K)
@@ -186,32 +185,43 @@ def plot_temperature_vs_time(sol, timestamp, thermistor_0_data, voltage_func, cu
 	"""
 	# Evaluate solution at evenly spaced time points
 	t_eval = np.linspace(timestamp[0], timestamp[-1], min(500, len(timestamp)))
-	T_solution = sol.sol(t_eval)  # Shape: (N_x, len(t_eval))
+	T_solution = sol.sol(t_eval)  # Shape: (N_x+1, len(t_eval)) - last row is Th
 	
-	# Convert to Celsius and get temperature at x=0
-	T_at_x0_C = T_solution[0, :] - 273.15
-	T_at_x0_K = T_solution[0, :]  # Keep in Kelvin for heat flux calculation
+	# Extract rod temperatures and Th
+	N_x = T_solution.shape[0] - 1  # Number of rod grid points
+	T_rod_solution = T_solution[:N_x, :]  # Rod temperatures
+	Th_solution = T_solution[N_x, :]  # Hot side temperature
 	
-	# Calculate heat flux Q at x=0 for each time point
+	# Convert to Celsius and get temperature at x=0 (Tc)
+	T_at_x0_C = T_rod_solution[0, :] - 273.15
+	T_at_x0_K = T_rod_solution[0, :]  # Keep in Kelvin for heat flux calculation
+	Th_C = Th_solution - 273.15  # Hot side temperature in Celsius
+	
+	# Calculate Qc (heat flow rate) at x=0 for each time point using form from heatpump.py
 	A = np.pi * radius**2
-	Q_at_x0 = np.zeros_like(t_eval)
+	Qc_at_x0 = np.zeros_like(t_eval)
 	
 	for i, t in enumerate(t_eval):
+		# Calculate I from V using: I(t) = (V(t) - α(T_h - T_c)) / R
 		V = voltage_func(t)
-		I = current_func(t)
 		Tc = T_at_x0_K[i]
-		delta_T = (V - I * R) / alpha
-		# Heat flux: Q = -(1/A) * [αITc - (1/2)I²R - K(Th - Tc)]
-		Q_at_x0[i] = -(1.0 / A) * (alpha * I * Tc - 0.5 * I**2 * R - K * delta_T)
+		Th = Th_solution[i]
+		I = (V - alpha * (Th - Tc)) / R
+		# Qc = -αITc + (1/2)I²R + K(Th - Tc)  (heat added to cold plate)
+		Qc_at_x0[i] = calculate_qc(alpha, I, Tc, R, K, Th)
+	
+	# Convert to heat flux for plotting (W/m²)
+	Q_at_x0 = Qc_at_x0 / A
 	
 	# Create figure with three subplots
 	fig, axes = plt.subplots(3, 1, figsize=(10, 12))
 	
-	# Plot 1: Temperature at x=0 from heat equation solution
-	axes[0].plot(t_eval, T_at_x0_C, 'b-', linewidth=2, label='x=0 (cold end, Peltier side)')
+	# Plot 1: Temperature at x=0 (Tc) and Th from heat equation solution
+	axes[0].plot(t_eval, T_at_x0_C, 'b-', linewidth=2, label='Tc (cold side, x=0)')
+	axes[0].plot(t_eval, Th_C, 'r-', linewidth=2, label='Th (hot side)')
 	axes[0].set_xlabel('Time (s)', fontsize=12)
 	axes[0].set_ylabel('Temperature (°C)', fontsize=12)
-	axes[0].set_title('Temperature vs Time at x=0 (Heat Equation Solution)', fontsize=14, fontweight='bold')
+	axes[0].set_title('Temperatures vs Time (Heat Equation Solution)', fontsize=14, fontweight='bold')
 	axes[0].grid(True, alpha=0.3)
 	axes[0].legend(loc='best', fontsize=11)
 	
@@ -246,13 +256,13 @@ def main():
 	# Thermoelectric device parameters
 	alpha = 0.05  # V/K (Seebeck coefficient)
 	K = 0.5  # W/K (Thermal conductance of Peltier)
-	R = 1.0  # Ohm (Electrical resistance, can be estimated from V/I)
+	R = 2.5  # Ohm (Electrical resistance, can be estimated from V/I)
 	T_cold = 298.15  # K (25°C, cold side temperature, initial/reference)
 	# Note: delta_T is calculated dynamically from V = IR + αΔT
 	
 	# Brass cylinder parameters
 	radius = 0.015  # m (1.5 cm)
-	L = 0.1  # m (assumed length, adjust as needed)
+	L = 0.041  # m (assumed length, adjust as needed)
 	
 	# Brass material properties
 	D_brass = 3.4e-5  # m²/s (Thermal diffusivity of brass)
@@ -264,15 +274,31 @@ def main():
 	h = 10.0  # W/(m²·K) (Convective heat transfer coefficient, typical for natural convection)
 	T_infinity = 298.15  # K (Ambient/environment temperature, 25°C)
 	
+	# Ceramic plate parameters (only for hot side - solving Th via ODE)
+	# Ceramic properties: Aluminum Oxide (Al2O3) - typical for Peltier devices
+	rho_ceramic = 3970.0  # kg/m³ (Al2O3 density)
+	c_ceramic = 775.0  # J/(kg·K) (Al2O3 specific heat capacity)
+	thickness_ceramic = 0.002  # m (typical ceramic plate thickness ~2mm)
+	volume_ceramic_hot = np.pi * radius**2 * thickness_ceramic  # m³
+	mass_ceramic_hot = rho_ceramic * volume_ceramic_hot  # kg
+	C_ceramic_hot = mass_ceramic_hot * c_ceramic  # J/K (heat capacity)
+	A_ceramic_hot = 2 * np.pi * radius**2 + 2 * np.pi * radius * thickness_ceramic  # m²
+	h_ceramic_hot = 10.0  # W/(m²·K) (Convective heat transfer coefficient)
+	# Note: No ceramic parameters for cold side - T[0] is the cold plate temperature, no separate ODE
+	
 	# Numerical parameters
 	N_x = 100  # Number of spatial points
 	rtol = 1e-6  # Relative tolerance for ODE solver
 	atol = 1e-8  # Absolute tolerance for ODE solver
 	
-	# Calculate Q̇c (using average delta_T for statistics)
+	# Calculate Qc statistics (using average values for initial estimate)
 	# delta_T is calculated from V = IR + αΔT, so ΔT = (V - IR) / α
+	# For statistics, estimate Th_avg = T_cold + delta_T_avg
 	delta_T_avg = np.mean((voltage - current * R) / alpha)
-	qc_dot = calculate_qc_dot(voltage, current, alpha, K, T_cold, delta_T_avg)
+	Th_avg = T_cold + delta_T_avg
+	V_avg = np.mean(voltage)
+	I_avg = (V_avg - alpha * delta_T_avg) / R
+	qc_dot = calculate_qc(alpha, I_avg, T_cold, R, K, Th_avg)
 	
 	# Set up spatial grid for 1D heat equation
 	x_grid = np.linspace(0, L, N_x)
@@ -280,21 +306,22 @@ def main():
 	# Initial temperature distribution (uniform at ambient)
 	T_initial = np.ones(N_x) * T_cold
 	
-	# Create interpolation functions for voltage and current
+	# Create interpolation function for voltage
 	from scipy.interpolate import interp1d
 	voltage_interp = interp1d(timestamp, voltage, kind='linear', 
 	                          fill_value=(voltage[0], voltage[-1]), bounds_error=False)
-	current_interp = interp1d(timestamp, current, kind='linear',
-	                          fill_value=(current[0], current[-1]), bounds_error=False)
 	
 	# Time span for solving
 	t_span = (timestamp[0], timestamp[-1])
 	
-	# Solve 1D heat equation
-	print("Solving 1D heat equation...")
-	sol = solve_1d_heat_equation(t_span, x_grid, T_initial, voltage_interp, current_interp,
+	# Solve 1D heat equation with coupled Th (Tc = T[0], no separate ODE)
+	print("Solving 1D heat equation with coupled Th...")
+	print("  T[0] is the cold plate temperature (no separate ceramic ODE)")
+	print("  Th is solved via: C_h * Ṫ_h = Q_h + h_h * A_h * (T_∞ - T_h)")
+	sol = solve_1d_heat_equation(t_span, x_grid, T_initial, voltage_interp,
 	                             L, radius, alpha, K, T_cold, R, D_brass, k_brass,
-	                             h, rho_brass, c_brass, T_infinity, rtol, atol)
+	                             h, rho_brass, c_brass, T_infinity, 
+	                             C_ceramic_hot, A_ceramic_hot, h_ceramic_hot, rtol, atol)
 	
 	# Print summary statistics
 	print(f"\nData Summary for {filepath}:")
@@ -326,11 +353,15 @@ def main():
 	print(f"\nHeat Equation Solution:")
 	print(f"  Solution computed successfully")
 	print(f"  Number of time steps: {len(sol.t)}")
-	print(f"  Final temperature at x=0: {sol.y[0, -1]-273.15:.2f} °C")
-	print(f"  Final temperature at x=L: {sol.y[-1, -1]-273.15:.2f} °C")
+	N_x = len(x_grid)
+	print(f"  Final temperature at x=0 (Tc): {sol.y[0, -1]-273.15:.2f} °C")
+	print(f"  Final temperature at x=L: {sol.y[N_x-1, -1]-273.15:.2f} °C")
+	print(f"  Final hot side temperature (Th): {sol.y[N_x, -1]-273.15:.2f} °C")
+	print(f"  Final ΔT (Th - Tc): {sol.y[N_x, -1] - sol.y[0, -1]:.2f} K")
 	
 	# Plot temperature as a function of time at x=0 and thermistor 0 data
-	plot_temperature_vs_time(sol, timestamp, thermistor_0)
+	plot_temperature_vs_time(sol, timestamp, thermistor_0, voltage_interp,
+	                         radius, alpha, K, R)
 
 
 if __name__ == '__main__':
