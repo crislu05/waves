@@ -3,7 +3,7 @@ Parameter Optimization for Coupled Heat Pump ODE System
 """
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, differential_evolution
 from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -13,7 +13,7 @@ from heatpump import load_dataset, solve_coupled_heat_pump
 
 def objective_function(params_vector, fixed_params, experimental_data):
     """Objective function: MSE between model and experimental data."""
-    alpha, K_therm, R_elec, h_hot = params_vector
+    alpha, K_therm, R_elec = params_vector
     
     # Fixed parameters
     rho_ceramic = fixed_params['rho_ceramic']
@@ -23,6 +23,7 @@ def objective_function(params_vector, fixed_params, experimental_data):
     C_hot_plate = fixed_params['C_hot_plate']
     thickness_grease = fixed_params['thickness_grease']
     k_grease = fixed_params['k_grease']
+    h_hot = fixed_params['h_hot']  # Fixed at 200.0
     
     # Calculate derived parameters
     volume_plate = np.pi * radius_plate**2 * thickness_plate
@@ -63,7 +64,26 @@ def objective_function(params_vector, fixed_params, experimental_data):
         T_brass_thermistor = T_brass_all[thermistor_node_idx, :]
         T_brass_thermistor_C = T_brass_thermistor - 273.15
         
-        return np.mean((T_brass_thermistor_C - thermistor_0_eval)**2)
+        # For sinusoidal/oscillatory data with transients, use a combination metric:
+        # 1. MSE (captures amplitude and overall fit)
+        mse = np.mean((T_brass_thermistor_C - thermistor_0_eval)**2)
+        
+        # 2. Correlation coefficient (captures phase alignment and shape similarity)
+        # Remove mean to focus on oscillatory behavior
+        model_centered = T_brass_thermistor_C - np.mean(T_brass_thermistor_C)
+        exp_centered = thermistor_0_eval - np.mean(thermistor_0_eval)
+        if np.std(model_centered) > 1e-6 and np.std(exp_centered) > 1e-6:
+            correlation = np.corrcoef(model_centered, exp_centered)[0, 1]
+            # Convert correlation (0-1) to error metric (0 = perfect, 1 = worst)
+            correlation_error = 1.0 - correlation
+        else:
+            correlation_error = 1.0
+        
+        # 3. Weighted combination: 70% MSE, 30% correlation error
+        # This balances amplitude accuracy with phase/shape matching
+        combined_error = 0.7 * mse + 0.3 * correlation_error * np.var(thermistor_0_eval)
+        
+        return combined_error
     except Exception:
         return 1e10
 
@@ -88,8 +108,9 @@ def setup_optimization():
             2 * (heat_sink_length * heat_sink_height) + 2 * (heat_sink_width * heat_sink_height)
     
     # Spatial grid with node at thermistor position (3mm)
+    # Use higher resolution for better accuracy (matches heatpump.py)
     thermistor_x_pos = 0.003
-    N_nodes = 20
+    N_nodes = 50  # Higher resolution (matches heatpump.py)
     n_before = max(1, int((thermistor_x_pos / L_brass) * (N_nodes - 1)))
     n_after = N_nodes - n_before - 1
     
@@ -111,10 +132,11 @@ def setup_optimization():
         'T_inf': T_inf, 'k_brass': k_brass, 'rho_brass': rho_brass,
         'c_brass': c_brass, 'L_brass': L_brass, 'N_nodes': N_nodes,
         'x_grid': x_grid, 'thermistor_node_idx': thermistor_node_idx,
-        'A_hot': A_hot, 'rtol': 1e-3, 'atol': 1e-5,
+        'A_hot': A_hot, 'rtol': 1e-4, 'atol': 1e-6,  # More relaxed tolerance for optimization speed
         'rho_ceramic': 3970.0, 'c_ceramic': 775.0,
         'radius_plate': 0.015, 'thickness_plate': 0.002,
-        'C_hot_plate': 300.0, 'thickness_grease': 0.0001, 'k_grease': 1.0
+        'C_hot_plate': 300.0, 'thickness_grease': 0.0001, 'k_grease': 1.0,
+        'h_hot': 200.0  # Fixed convective coefficient
     }
     
     experimental_data = {
@@ -123,39 +145,57 @@ def setup_optimization():
         'T_initial': T_initial
     }
     
-    initial_params = np.array([0.05, 0.5, 2.5, 200.0])  # alpha, K_therm, R_elec, h_hot
-    bounds = [(0.01, 0.10), (0.1, 2.0), (1.0, 5.0), (20.0, 300.0)]
+    initial_params = np.array([0.05, 0.5, 2.5])  # alpha, K_therm, R_elec
+    bounds = [(0.01, 0.7), (0.1, 2.0), (1.0, 5.0)]
     
     return initial_params, bounds, fixed_params, experimental_data
 
 
-def optimize_parameters(method='L-BFGS-B', quick_test=False):
+def optimize_parameters(quick_test=False):
     """Optimize parameters."""
     initial_params, bounds, fixed_params, experimental_data = setup_optimization()
     
-    param_names = ['alpha', 'K_therm', 'R_elec', 'h_hot']
+    param_names = ['alpha', 'K_therm', 'R_elec']
     print(f"\nInitial Parameters: {dict(zip(param_names, initial_params))}")
     print(f"Bounds: {dict(zip(param_names, bounds))}\n")
     
     def objective_wrapper(params):
         return objective_function(params, fixed_params, experimental_data)
     
-    maxiter = 3 if quick_test else 50
-    result = minimize(objective_wrapper, initial_params, method=method,
-                     bounds=bounds, options={'maxiter': maxiter, 'disp': True})
+    # Use global optimizer to systematically explore all values within bounds
+    print("Using differential_evolution (global optimizer)")
+    print("This will systematically search all values within the bounds...\n")
+    maxiter = 10 if quick_test else 100
+    popsize = 5 if quick_test else 30  # Increased to maintain population diversity
+    result = differential_evolution(
+        objective_wrapper, bounds,
+        seed=42, maxiter=maxiter, popsize=popsize,
+        tol=1e-9, atol=1e-9, polish=True, disp=True
+    )
     
     print(f"\nOptimization completed!")
     print(f"  Success: {result.success}")
-    print(f"  Final MSE: {result.fun:.6f} °C², RMSE: {np.sqrt(result.fun):.4f} °C")
-    print(f"  Iterations: {result.nit}, Function evaluations: {result.nfev}")
+    print(f"  Message: {result.message}")
+    print(f"  Final Objective: {result.fun:.6f} (combined MSE + correlation error)")
+    print(f"  Iterations: {result.nit}/{maxiter}, Function evaluations: {result.nfev}")
     print(f"  Optimized Parameters: {dict(zip(param_names, result.x))}")
     
-    return result, dict(zip(param_names, result.x))
+    # Save optimized parameters to file for use in heatpump.py
+    import json
+    optimized_params = dict(zip(param_names, result.x))
+    params_file = Path('data/netflux/optimized_parameters.json')
+    params_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(params_file, 'w') as f:
+        json.dump(optimized_params, f, indent=4)
+    print(f"\nOptimized parameters saved to: {params_file}")
+    
+    return result, optimized_params
 
 
 def plot_optimization_results(result, fixed_params, experimental_data):
     """Plot comparison between optimized model and experimental data."""
-    alpha, K_therm, R_elec, h_hot = result.x
+    alpha, K_therm, R_elec = result.x
+    h_hot = fixed_params['h_hot']  # Fixed at 200.0
     
     # Calculate derived parameters
     radius_plate = fixed_params['radius_plate']
@@ -231,7 +271,8 @@ def main():
     print("Parameter Optimization for Coupled Heat Pump ODE System")
     print("=" * 70)
     
-    result, optimized_params = optimize_parameters(method='L-BFGS-B', quick_test=False)
+    # Use global optimizer to systematically search all values within bounds
+    result, optimized_params = optimize_parameters(quick_test=False)
     
     _, _, fixed_params, experimental_data = setup_optimization()
     plot_optimization_results(result, fixed_params, experimental_data)

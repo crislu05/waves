@@ -258,10 +258,28 @@ def main():
     thermistor_0 = thermistor_temperatures[:, 0]  # First column contains thermistor 0 data
     T_initial_from_data = thermistor_0[0] + 273.15  # Convert from Celsius to Kelvin
     
-    # Thermoelectric device parameters
-    alpha = 0.05  # V/K (Seebeck coefficient)
-    K_therm = 0.5  # W/K (Thermal conductance of Peltier)
-    R_elec = 2.5 # Ohm (Electrical resistance)
+    # Thermoelectric device parameters (load from optimization results)
+    import json
+    from pathlib import Path
+    params_file = Path('data/netflux/optimized_parameters.json')
+    
+    if params_file.exists():
+        with open(params_file, 'r') as f:
+            optimized_params = json.load(f)
+        alpha = optimized_params.get('alpha', 0.05)  # V/K (Seebeck coefficient)
+        K_therm = optimized_params.get('K_therm', 0.5)  # W/K (Thermal conductance of Peltier)
+        R_elec = optimized_params.get('R_elec', 2.5)  # Ohm (Electrical resistance)
+        print(f"Loaded optimized parameters from {params_file}:")
+        print(f"  alpha: {alpha:.6f} V/K")
+        print(f"  K_therm: {K_therm:.6f} W/K")
+        print(f"  R_elec: {R_elec:.6f} Ω")
+    else:
+        # Default values if optimization file doesn't exist
+        alpha = 0.05  # V/K (Seebeck coefficient)
+        K_therm = 0.5  # W/K (Thermal conductance of Peltier)
+        R_elec = 2.5  # Ohm (Electrical resistance)
+        print(f"Warning: {params_file} not found. Using default parameters.")
+        print(f"  Run optimse.py first to generate optimized parameters.")
     
     # Ambient temperature
     T_inf = 298.15  # K (25°C, ambient temperature)
@@ -279,7 +297,7 @@ def main():
     
     # Hot side thermal mass: Large finned heat sink with fan
     # The hot side is attached to a large finned heat sink, so C_hot is much larger than the ceramic plate alone
-    C_hot_plate = 300.0  # J/K (heat capacity of hot side including heat sink, 200-400 J/K range)
+    C_hot_plate = 300.0  # J/K (heat capacity of hot side including heat sink, matches optimse.py)
     
     # Brass cylinder properties (from session6.py)
     rho_brass = 8520.0  # kg/m³ (Density of brass)
@@ -328,9 +346,9 @@ def main():
     side_area = 2 * (heat_sink_length * heat_sink_height) + 2 * (heat_sink_width * heat_sink_height)  # m²
     A_hot = base_area + total_fin_area + base_area + side_area  # m² (total surface area)
     
-    # Numerical parameters
-    rtol = 1e-6  # Relative tolerance for ODE solver
-    atol = 1e-8  # Absolute tolerance for ODE solver
+    # Numerical parameters (match optimse.py for consistency)
+    rtol = 1e-6  # Relative tolerance for ODE solver (higher precision)
+    atol = 1e-8  # Absolute tolerance for ODE solver (higher precision)
     
     # Create interpolation function for voltage
     voltage_interp = interp1d(timestamp, voltage, kind='linear',
