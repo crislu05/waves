@@ -2,8 +2,17 @@ import pandas as pd
 import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.interpolate import interp1d
+from scipy.signal import savgol_filter
 import matplotlib.pyplot as plt
 from pathlib import Path
+from validity import (
+    get_thermistor_positions,
+    plot_temperatures_vs_time,
+    plot_residual_distributions,
+    plot_mean_residual_distribution,
+    plot_rmse_and_correlation_vs_position,
+    save_temperature_data_to_csv
+)
 
 
 def load_dataset(path):
@@ -174,94 +183,27 @@ def solve_coupled_heat_pump(t_span, T_initial, voltage_func, params, rtol, atol,
     return sol
 
 
-def plot_temperatures_vs_time(sol, timestamp, thermistor_0, x_grid, thermistor_x_pos, voltage_func, params, save_path=None):
+def setup_parameters(params_file=None, verbose=True):
     """
-    Plot T_brass at thermistor position, thermistor_0 temperature, and Qc as a function of time.
+    Set up all physical parameters for the heat pump model.
     
     Parameters:
-    - sol: Solution object from solve_ivp
-    - timestamp: Original time data for reference
-    - thermistor_0: Array of thermistor 0 temperatures from experimental data
-    - x_grid: Spatial grid positions along the brass rod
-    - thermistor_x_pos: x position of thermistor 0 in meters (e.g., 0.003 for 3mm)
-    - voltage_func: Function V(t) returning voltage at time t
-    - params: Dictionary containing physical parameters
-    - save_path: Path to save the plot (if None, plot is displayed)
+    - params_file: Optional path to JSON file with optimized parameters.
+                   If None, uses default path 'data/netflux/optimized_parameters.json'
+    - verbose: If True, print parameter information
+    
+    Returns:
+    - params: Dictionary containing all physical parameters
+    - L_brass: Length of brass rod (m)
+    - N_nodes: Number of spatial nodes
     """
-    # Evaluate solution at evenly spaced time points
-    t_eval = np.linspace(timestamp[0], timestamp[-1], min(500, len(timestamp)))
-    T_solution = sol.sol(t_eval)  # Shape: (2 + N_nodes, len(t_eval)) - [Tc, Th, T_brass[0], ..., T_brass[N-1]]
-    
-    # Extract temperatures
-    Tc = T_solution[0, :]  # Cold plate temperature in Kelvin
-    Th = T_solution[1, :]  # Hot plate temperature in Kelvin
-    T_brass_all = T_solution[2:, :]  # Shape: (N_nodes, len(t_eval))
-    
-    # Interpolate to get exact temperature at thermistor position (3mm)
-    T_brass_thermistor = np.zeros(len(t_eval))
-    for i in range(len(t_eval)):
-        # Interpolate spatially at each time point
-        T_brass_interp = interp1d(x_grid, T_brass_all[:, i], kind='linear', 
-                                  fill_value='extrapolate', bounds_error=False)
-        T_brass_thermistor[i] = T_brass_interp(thermistor_x_pos)
-    
-    # Calculate Qc for each time point
-    Qc = np.zeros_like(t_eval)
-    for i, t in enumerate(t_eval):
-        V = voltage_func(t)
-        I = (V - params['alpha'] * (Th[i] - Tc[i])) / params['R_elec']
-        Qc[i] = calculate_qc(params['alpha'], I, Tc[i], params['R_elec'], params['K_therm'], Th[i])
-    
-    # Convert to Celsius for plotting
-    T_brass_thermistor_C = T_brass_thermistor - 273.15
-    
-    # Create figure with two subplots
-    fig, axes = plt.subplots(2, 1, figsize=(10, 10))
-    
-    # Plot 1: Temperature comparison
-    axes[0].plot(t_eval, T_brass_thermistor_C, 'g-', linewidth=2, 
-                 label=f'T_brass (Model, x={thermistor_x_pos*1000:.1f}mm)')
-    axes[0].plot(timestamp, thermistor_0, 'b-', linewidth=2, label='Thermistor 0 (Experimental)', alpha=0.7)
-    axes[0].set_xlabel('Time (s)', fontsize=12)
-    axes[0].set_ylabel('Temperature (°C)', fontsize=12)
-    axes[0].set_title(f'Brass Temperature at x={thermistor_x_pos*1000:.1f}mm vs Time', fontsize=14, fontweight='bold')
-    axes[0].grid(True, alpha=0.3)
-    axes[0].legend(loc='best', fontsize=11)
-    
-    # Plot 2: Heat flux at cold plate (Qc)
-    axes[1].plot(t_eval, Qc, 'r-', linewidth=2, label='Qc (Cold plate heat flux)')
-    axes[1].set_xlabel('Time (s)', fontsize=12)
-    axes[1].set_ylabel('Heat Flux Qc (W)', fontsize=12)
-    axes[1].set_title('Cold Plate Heat Flux vs Time', fontsize=14, fontweight='bold')
-    axes[1].grid(True, alpha=0.3)
-    axes[1].axhline(y=0, color='k', linestyle='--', linewidth=0.8, alpha=0.5)
-    axes[1].legend(loc='best', fontsize=11)
-    
-    plt.tight_layout()
-    
-    # Save plot if save_path is provided
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Plot saved to: {save_path}")
-        plt.close()
-    else:
-        plt.show(block=True)
-
-
-def main():
-    """Main function to solve coupled heat pump equations."""
-    # Load data (same as session6.py)
-    filepath = 'data/session6/brass_7V_10s.csv'
-    timestamp, voltage, _, thermistor_temperatures = load_dataset(filepath)
-    
-    # Extract thermistor_0 data and get initial temperature
-    thermistor_0 = thermistor_temperatures[:, 0]  # First column contains thermistor 0 data
-    T_initial_from_data = thermistor_0[0] + 273.15  # Convert from Celsius to Kelvin
-    
-    # Thermoelectric device parameters (load from optimization results)
     import json
-    from pathlib import Path
-    params_file = Path('data/netflux/optimized_parameters.json')
+    
+    # Load optimized parameters
+    if params_file is None:
+        params_file = Path("data/netflux/optimized_parameters.json")
+    else:
+        params_file = Path(params_file)
     
     if params_file.exists():
         with open(params_file, 'r') as f:
@@ -269,17 +211,19 @@ def main():
         alpha = optimized_params.get('alpha', 0.05)  # V/K (Seebeck coefficient)
         K_therm = optimized_params.get('K_therm', 0.5)  # W/K (Thermal conductance of Peltier)
         R_elec = optimized_params.get('R_elec', 2.5)  # Ohm (Electrical resistance)
-        print(f"Loaded optimized parameters from {params_file}:")
-        print(f"  alpha: {alpha:.6f} V/K")
-        print(f"  K_therm: {K_therm:.6f} W/K")
-        print(f"  R_elec: {R_elec:.6f} Ω")
+        if verbose:
+            print(f"Loaded optimized parameters from {params_file}:")
+            print(f"  alpha: {alpha:.6f} V/K")
+            print(f"  K_therm: {K_therm:.6f} W/K")
+            print(f"  R_elec: {R_elec:.6f} Ω")
     else:
         # Default values if optimization file doesn't exist
         alpha = 0.05  # V/K (Seebeck coefficient)
         K_therm = 0.5  # W/K (Thermal conductance of Peltier)
         R_elec = 2.5  # Ohm (Electrical resistance)
-        print(f"Warning: {params_file} not found. Using default parameters.")
-        print(f"  Run optimse.py first to generate optimized parameters.")
+        if verbose:
+            print(f"Warning: {params_file} not found. Using default parameters.")
+            print(f"  Run optimse.py first to generate optimized parameters.")
     
     # Ambient temperature
     T_inf = 298.15  # K (25°C, ambient temperature)
@@ -301,7 +245,7 @@ def main():
     
     # Brass cylinder properties (from session6.py)
     rho_brass = 8520.0  # kg/m³ (Density of brass)
-    c_brass = 380.0  # J/(kg·K) (Specific heat capacity of brass) d
+    c_brass = 380.0  # J/(kg·K) (Specific heat capacity of brass)
     k_brass = 109.0  # W/(m·K) (Thermal conductivity of brass)
     radius_brass = 0.015  # m (1.5 cm, same as ceramic plate)
     L_brass = 0.041  # m (length of brass cylinder)
@@ -313,16 +257,6 @@ def main():
     
     # Spatial discretization for brass rod
     N_nodes = 50  # Number of nodes along the brass rod
-    x_grid = np.linspace(0, L_brass, N_nodes)  # Spatial grid
-    dx = L_brass / (N_nodes - 1)  # Spatial step size
-    
-    # Initial temperatures: [Tc, Th, T_brass[0], ..., T_brass[N-1]]
-    # Use first thermistor 0 measurement as initial temperature
-    T_cold_initial = T_initial_from_data  # K (from thermistor 0 first data point)
-    T_hot_initial = T_initial_from_data  # K (from thermistor 0 first data point)
-    T_brass_initial = T_initial_from_data  # K (from thermistor 0 first data point)
-    T_brass_array = np.full(N_nodes, T_brass_initial)  # Initial temperature profile (uniform)
-    T_initial = np.concatenate([[T_cold_initial, T_hot_initial], T_brass_array])
     
     # Convective heat transfer parameters
     h_hot = 200  # W/(m²·K) (Convective heat transfer coefficient for hot plate with fan)
@@ -346,17 +280,6 @@ def main():
     side_area = 2 * (heat_sink_length * heat_sink_height) + 2 * (heat_sink_width * heat_sink_height)  # m²
     A_hot = base_area + total_fin_area + base_area + side_area  # m² (total surface area)
     
-    # Numerical parameters (match optimse.py for consistency)
-    rtol = 1e-6  # Relative tolerance for ODE solver (higher precision)
-    atol = 1e-8  # Absolute tolerance for ODE solver (higher precision)
-    
-    # Create interpolation function for voltage
-    voltage_interp = interp1d(timestamp, voltage, kind='linear',
-                              fill_value=(voltage[0], voltage[-1]), bounds_error=False)
-    
-    # Time span for solving
-    t_span = (timestamp[0], timestamp[-1])
-    
     # Create parameters dictionary
     params = {
         'alpha': alpha,
@@ -377,6 +300,135 @@ def main():
         'N_nodes': N_nodes
     }
     
+    if verbose:
+        print(f"\nParameters:")
+        print(f"  α (Seebeck coefficient): {alpha:.3f} V/K")
+        print(f"  K_therm (Thermal conductance): {K_therm:.2f} W/K")
+        print(f"  R_elec (Electrical resistance): {R_elec:.2f} Ω")
+        print(f"\nThermal Masses:")
+        print(f"  C_cold_plate: {C_cold_plate:.2f} J/K (ceramic plate)")
+        print(f"  C_hot_plate: {C_hot_plate:.2f} J/K (heat sink with fan, 200-400 J/K range)")
+        print(f"\nHot Side Heat Sink:")
+        print(f"  Dimensions: {heat_sink_length*100:.0f} × {heat_sink_width*100:.0f} × {heat_sink_height*100:.0f} cm")
+        print(f"  Number of fins: {n_fins}")
+        print(f"  Fin dimensions: {fin_length*100:.1f} × {fin_width*100:.0f} cm each")
+        print(f"  Surface area (A_hot): {A_hot:.4f} m² (including fins)")
+        print(f"  Convective coefficient (h_hot): {h_hot:.0f} W/(m²·K) (with fan)")
+        print(f"\nBrass Rod Properties:")
+        print(f"  Length: {L_brass*100:.1f} cm")
+        print(f"  Radius: {radius_brass*100:.1f} cm")
+        print(f"  Thermal conductivity (k_brass): {k_brass:.1f} W/(m·K)")
+        print(f"  Density (ρ_brass): {rho_brass:.0f} kg/m³")
+        print(f"  Specific heat (c_brass): {c_brass:.0f} J/(kg·K)")
+        print(f"  Thermal diffusivity (α): {k_brass/(rho_brass*c_brass):.2e} m²/s")
+        print(f"  Number of nodes: {N_nodes}")
+        print(f"  Spatial step (dx): {L_brass/(N_nodes-1)*1000:.3f} mm")
+        print(f"\nGrease Layer:")
+        print(f"  Thickness: {thickness_grease*1000:.2f} mm")
+        print(f"  Thermal conductivity: {k_grease:.1f} W/(m·K)")
+        print(f"  R''_grease (specific): {thickness_grease/k_grease:.6e} m²·K/W")
+        print(f"  Contact area (A_contact): {A_contact*1e6:.2f} mm²")
+    
+    return params, L_brass, N_nodes
+
+
+def create_voltage_interpolation(timestamp, voltage):
+    """
+    Create interpolation function for voltage.
+    
+    Parameters:
+    - timestamp: Time array
+    - voltage: Voltage array
+    
+    Returns:
+    - voltage_interp: Interpolation function V(t)
+    """
+    return interp1d(timestamp, voltage, kind='linear',
+                   fill_value=(voltage[0], voltage[-1]), bounds_error=False)
+
+
+def setup_initial_conditions(thermistor_data_dict, N_nodes, thermistor_id=0):
+    """
+    Set up initial conditions from thermistor data.
+    
+    Parameters:
+    - thermistor_data_dict: Dictionary mapping thermistor_id to {'data': array, 'x_pos': float}
+    - N_nodes: Number of spatial nodes
+    - thermistor_id: Which thermistor to use for initial temperature (default: 0)
+    
+    Returns:
+    - T_initial: Initial temperature array [Tc, Th, T_brass[0], ..., T_brass[N-1]] in Kelvin
+    - T0: Initial temperature in Kelvin
+    """
+    if thermistor_id not in thermistor_data_dict:
+        raise ValueError(f"Thermistor {thermistor_id} data is required for initial condition!")
+    
+    T_initial_from_data = thermistor_data_dict[thermistor_id]['data'][0] + 273.15  # Convert from Celsius to Kelvin
+    T0 = T_initial_from_data
+    
+    T_cold_initial = T0
+    T_hot_initial = T0
+    T_brass_initial = T0
+    T_brass_array = np.full(N_nodes, T_brass_initial)
+    T_initial = np.concatenate([[T_cold_initial, T_hot_initial], T_brass_array])
+    
+    return T_initial, T0
+
+
+def create_thermistor_data_dict(thermistor_temperatures, thermistor_positions=None):
+    """
+    Create thermistor data dictionary from thermistor temperature array.
+    
+    Parameters:
+    - thermistor_temperatures: Array of thermistor temperatures (shape: [n_time, n_thermistors])
+    - thermistor_positions: Optional dictionary mapping thermistor_id to position (m).
+                          If None, uses get_thermistor_positions()
+    
+    Returns:
+    - thermistor_data_dict: Dictionary mapping thermistor_id to {'data': array, 'x_pos': float}
+    """
+    if thermistor_positions is None:
+        thermistor_positions = get_thermistor_positions()
+    
+    thermistor_data_dict = {}
+    n_thermistors_available = thermistor_temperatures.shape[1]
+    
+    for therm_id, x_pos in thermistor_positions.items():
+        if therm_id < n_thermistors_available:
+            thermistor_data_dict[therm_id] = {
+                'data': thermistor_temperatures[:, therm_id],
+                'x_pos': x_pos
+            }
+    
+    return thermistor_data_dict
+
+
+def main():
+    """Main function to solve coupled heat pump equations."""
+    # Load data
+    filepath = 'data/session6/brass_7V_10s.csv'
+    timestamp, voltage, _, thermistor_temperatures = load_dataset(filepath)
+    
+    # Create thermistor data dictionary
+    thermistor_data_dict = create_thermistor_data_dict(thermistor_temperatures)
+    
+    # Setup parameters
+    params, L_brass, N_nodes = setup_parameters(verbose=True)
+    
+    # Create spatial grid
+    x_grid = np.linspace(0, L_brass, N_nodes)
+    dx = L_brass / (N_nodes - 1)  # Spatial step size
+    
+    # Create voltage interpolation
+    voltage_interp = create_voltage_interpolation(timestamp, voltage)
+    
+    # Time span for solving
+    t_span = (timestamp[0], timestamp[-1])
+    
+    # Numerical parameters (match optimse.py for consistency)
+    rtol = 1e-6  # Relative tolerance for ODE solver (higher precision)
+    atol = 1e-8  # Absolute tolerance for ODE solver (higher precision)
+    
     # Solve coupled heat pump equations
     print("Solving coupled heat pump equations with 1D brass rod PDE...")
     print(f"\nDifferential Equations:")
@@ -386,54 +438,40 @@ def main():
     print(f"\nBoundary Conditions:")
     print(f"  At x=0: -k_brass * (∂T/∂x)|_0 = q''")
     print(f"    where q'' = (T_brass[0] - Tc) / R''_grease (heat flux density in W/m²)")
-    print(f"    and R''_grease = thickness_grease / k_grease = {thickness_grease/k_grease:.6e} m²·K/W")
+    print(f"    and R''_grease = thickness_grease / k_grease = {params['thickness_grease']/params['k_grease']:.6e} m²·K/W")
     print(f"  At x=L: (∂T/∂x)|_L = 0 (insulated)")
     print(f"\n  where q_interface = q'' * A_contact (total heat flux in W)")
     print(f"  and I(t) = (V(t) - α(T_h - T_c)) / R_elec")
     print(f"  and α = k_brass / (ρ_brass * c_brass) = thermal diffusivity")
-    print(f"\nParameters:")
-    print(f"  α (Seebeck coefficient): {alpha:.3f} V/K")
-    print(f"  K_therm (Thermal conductance): {K_therm:.2f} W/K")
-    print(f"  R_elec (Electrical resistance): {R_elec:.2f} Ω")
-    print(f"\nThermal Masses:")
-    print(f"  C_cold_plate: {C_cold_plate:.2f} J/K (ceramic plate)")
-    print(f"  C_hot_plate: {C_hot_plate:.2f} J/K (heat sink with fan, 200-400 J/K range)")
-    print(f"\nHot Side Heat Sink:")
-    print(f"  Dimensions: {heat_sink_length*100:.0f} × {heat_sink_width*100:.0f} × {heat_sink_height*100:.0f} cm")
-    print(f"  Number of fins: {n_fins}")
-    print(f"  Fin dimensions: {fin_length*100:.1f} × {fin_width*100:.0f} cm each")
-    print(f"  Surface area (A_hot): {A_hot:.4f} m² (including fins)")
-    print(f"  Convective coefficient (h_hot): {h_hot:.0f} W/(m²·K) (with fan)")
-    print(f"\nBrass Rod Properties:")
-    print(f"  Length: {L_brass*100:.1f} cm")
-    print(f"  Radius: {radius_brass*100:.1f} cm")
-    print(f"  Thermal conductivity (k_brass): {k_brass:.1f} W/(m·K)")
-    print(f"  Density (ρ_brass): {rho_brass:.0f} kg/m³")
-    print(f"  Specific heat (c_brass): {c_brass:.0f} J/(kg·K)")
-    print(f"  Thermal diffusivity (α): {k_brass/(rho_brass*c_brass):.2e} m²/s")
-    print(f"  Number of nodes: {N_nodes}")
-    print(f"  Spatial step (dx): {dx*1000:.3f} mm")
-    print(f"\nGrease Layer:")
-    print(f"  Thickness: {thickness_grease*1000:.2f} mm")
-    print(f"  Thermal conductivity: {k_grease:.1f} W/(m·K)")
-    print(f"  R''_grease (specific): {thickness_grease/k_grease:.6e} m²·K/W")
-    print(f"  Contact area (A_contact): {A_contact*1e6:.2f} mm²")
-    print(f"\nInitial Conditions (from thermistor 0 first data point):")
-    print(f"  Initial Tc: {T_cold_initial-273.15:.2f} °C ({T_cold_initial:.2f} K)")
-    print(f"  Initial Th: {T_hot_initial-273.15:.2f} °C ({T_hot_initial:.2f} K)")
-    print(f"  Initial T_brass (uniform): {T_brass_initial-273.15:.2f} °C ({T_brass_initial:.2f} K)")
+    # Run separate numerical integration for each thermistor using its own T0
+    print(f"\nRunning numerical integration for each thermistor using its own T0...")
+    sol_dict = {}
     
-    sol = solve_coupled_heat_pump(t_span, T_initial, voltage_interp, params, rtol, atol, t_eval=None, method='Radau')
+    for therm_id, therm_info in sorted(thermistor_data_dict.items()):
+        # Set up initial conditions using this thermistor's T0
+        T_initial, T0_therm = setup_initial_conditions(
+            {therm_id: therm_info}, N_nodes, thermistor_id=therm_id
+        )
+        
+        print(f"  Thermistor {therm_id}: T0 = {T0_therm-273.15:.2f} °C ({T0_therm:.2f} K)")
+        
+        # Solve for this thermistor
+        sol = solve_coupled_heat_pump(t_span, T_initial, voltage_interp, params, rtol, atol, t_eval=None, method='Radau')
+        sol_dict[therm_id] = sol
     
-    # Print summary statistics
-    print(f"\nSolution Summary:")
+    print(f"  Completed {len(sol_dict)} numerical integrations")
+    
+    # Print summary statistics for first thermistor (as reference)
+    first_therm_id = min(sol_dict.keys())
+    sol_ref = sol_dict[first_therm_id]
+    print(f"\nSolution Summary (using thermistor {first_therm_id} as reference):")
     print(f"  Time range: {timestamp[0]:.2f} s to {timestamp[-1]:.2f} s")
     print(f"  Duration: {timestamp[-1] - timestamp[0]:.2f} s")
-    print(f"  Number of time steps: {len(sol.t)}")
+    print(f"  Number of time steps: {len(sol_ref.t)}")
     
-    # Evaluate final temperatures
+    # Evaluate final temperatures for reference thermistor
     t_final = timestamp[-1]
-    T_final = sol.sol(t_final)
+    T_final = sol_ref.sol(t_final)
     Tc_final = T_final[0]
     Th_final = T_final[1]
     T_brass_final = T_final[2:]  # Array of brass temperatures
@@ -455,9 +493,6 @@ def main():
     print(f"  Final Qc: {Qc_final:.4f} W")
     print(f"  Final Qh: {Qh_final:.4f} W")
     
-    # Thermistor 0 position: 3mm from x=0
-    thermistor_x_pos = 0.003  # m (3mm)
-    
     # Create plots directory if it doesn't exist
     plots_dir = Path('plots')
     plots_dir.mkdir(exist_ok=True)
@@ -466,17 +501,50 @@ def main():
     heatpump_plots_dir = plots_dir / 'heatpump'
     heatpump_plots_dir.mkdir(exist_ok=True)
     
-    # Generate plot filename
+    # Generate plot filenames
     plot_filename = 'heatpump_analysis.png'
     plot_path = heatpump_plots_dir / plot_filename
     
-    # Plot results and save
-    plot_temperatures_vs_time(sol, timestamp, thermistor_0, x_grid, thermistor_x_pos, 
-                              voltage_interp, params, save_path=str(plot_path))
+    rmse_plot_filename = 'rmse_correlation_vs_position.png'
+    rmse_plot_path = heatpump_plots_dir / rmse_plot_filename
+    
+    residual_dist_filename = 'residual_distributions.png'
+    residual_dist_path = heatpump_plots_dir / residual_dist_filename
+    
+    mean_residual_filename = 'mean_residual_distribution.png'
+    mean_residual_path = heatpump_plots_dir / mean_residual_filename
+    
+    # Plot temperature comparisons and save
+    plot_temperatures_vs_time(sol_dict, timestamp, thermistor_data_dict, x_grid, 
+                              voltage_interp, params, t_span, rtol, atol, N_nodes,
+                              save_path=str(plot_path))
+    
+    # Plot RMSE and correlation vs position
+    print("\nCalculating RMSE and Pearson Correlation for each thermistor...")
+    plot_rmse_and_correlation_vs_position(sol_dict, timestamp, thermistor_data_dict, x_grid,
+                                         save_path=str(rmse_plot_path))
+    
+    # Plot residual distributions for all thermistors
+    print("\nGenerating residual distribution plots for all thermistors...")
+    plot_residual_distributions(sol_dict, timestamp, thermistor_data_dict, x_grid,
+                               save_path=str(residual_dist_path))
+    
+    # Plot mean residual distribution (combined from all thermistors)
+    print("\nGenerating mean residual distribution plot (all thermistors combined)...")
+    plot_mean_residual_distribution(sol_dict, timestamp, thermistor_data_dict, x_grid,
+                                   save_path=str(mean_residual_path))
     
     # Create data directory for CSV
     data_dir = Path('data')
     data_dir.mkdir(exist_ok=True)
+    
+    # Save temperature comparison data to CSV
+    print("\nSaving temperature comparison data (model vs experimental) to CSV...")
+    comparison_dir = data_dir / 'comparison'
+    comparison_dir.mkdir(exist_ok=True)
+    temp_csv_path = comparison_dir / 'temperature_comparison_data.csv'
+    save_temperature_data_to_csv(sol_dict, timestamp, thermistor_data_dict, x_grid,
+                                save_path=str(temp_csv_path))
     
     # Create subdirectory for netflux data
     netflux_dir = data_dir / 'netflux'
@@ -485,7 +553,7 @@ def main():
     # Save data to CSV
     # Evaluate solution at evenly spaced time points for CSV export
     t_eval_csv = np.linspace(timestamp[0], timestamp[-1], min(1000, len(timestamp)))
-    T_solution_csv = sol.sol(t_eval_csv)
+    T_solution_csv = sol_ref.sol(t_eval_csv)
     
     # Extract temperatures
     Tc_csv = T_solution_csv[0, :]  # Cold plate temperature in Kelvin
